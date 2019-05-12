@@ -11,7 +11,7 @@ using namespace std;
 #define UB 10
 #define MASTER 0
 
-int M1[MAX_DIM][MAX_DIM], M2[MAX_DIM][MAX_DIM], M3[MAX_DIM][MAX_DIM];
+int M1[MAX_DIM][MAX_DIM], M2[MAX_DIM][MAX_DIM], M3[MAX_DIM][MAX_DIM], M4[MAX_DIM][MAX_DIM], M5[MAX_DIM][MAX_DIM];
 int dim;
 
 
@@ -53,6 +53,12 @@ void get_random_square_matrix(int A[MAX_DIM][MAX_DIM], int n)
             A[i][j] = rand() % UB;
             if(rand() % 2)
                 A[i][j] = -A[i][j];
+
+            /*
+            A[i][j] = i * j % UB;
+            if(i % 3 == 0)
+                A[i][j] = -A[i][j];
+                */
         }
 }
 
@@ -82,6 +88,29 @@ void print_array(const char *message, int *A, int n)
 
     printf("\n");
 }
+
+bool verify_correctness(int A[MAX_DIM][MAX_DIM], int B[MAX_DIM][MAX_DIM], int C[MAX_DIM][MAX_DIM],
+                        int R[MAX_DIM][MAX_DIM], int n)
+{
+    for(int i = 0; i < n; ++i)
+        for(int j = 0; j < n; ++j)
+        {
+            C[i][j] = 0;
+            for(int k = 0; k < n; ++k)
+                C[i][j] += A[i][k] * B[k][j];
+
+            if(R[i][j] != C[i][j])
+                return false;
+        }
+
+    /*for(int i = 0; i < n; ++i)
+        for(int j = 0; j < n; ++j)
+            if(C[i][j] != R[i][j])
+                return false;
+*/
+    return true;
+}
+
 
 
 // Initial distribution of the n / sqrt(p) - dimensional blocks for the n-dimensional matrix M to p processes;
@@ -174,8 +203,10 @@ void multiply_matrices(int *A, int *B, int *C, int n)
 void iterate_and_multiply(int *a, int *b, int *c, int n, int p, int processRank)
 {
     dim = sqrt(p);
-    int blockDim = n / dim, blockSize = blockDim * blockDim;
+    int blockDim = n / dim, blockSize = blockDim * blockDim, processRow, processCol;
     int *temp_a = new int[blockSize], *temp_b = new int[blockSize];
+
+    get_2D_indices(processRank, processRow, processCol);
 
     for(int i = 1; i <= dim; ++i)
     {
@@ -183,10 +214,6 @@ void iterate_and_multiply(int *a, int *b, int *c, int n, int p, int processRank)
 
         if(i < dim)
         {
-            int processRow, processCol;
-
-            get_2D_indices(processRank, processRow, processCol);
-
             int leftRecvr = get_1D_index(processRow, (processCol - 1 + dim) % dim),
                 rightSendr = get_1D_index(processRow, (processCol + 1) % dim),
                 upRecvr = get_1D_index((processRow - 1 + dim) % dim, processCol),
@@ -226,32 +253,11 @@ void collect_blocks(int M[MAX_DIM][MAX_DIM], int *sendBuf, int n, int p, int pro
     delete recvBuf;
 }
 
-bool verify_correctness(int A[MAX_DIM][MAX_DIM], int B[MAX_DIM][MAX_DIM], int C[MAX_DIM][MAX_DIM],
-                        int R[MAX_DIM][MAX_DIM], int n)
-{
-    for(int i = 0; i < n; ++i)
-        for(int j = 0; j < n; ++j)
-        {
-            C[i][j] = 0;
-            for(int k = 0; k < n; ++k)
-                C[i][j] += A[i][k] * B[k][j];
-
-            if(R[i][j] != C[i][j])
-                return false;
-        }
-
-    /*for(int i = 0; i < n; ++i)
-        for(int j = 0; j < n; ++j)
-            if(C[i][j] != R[i][j])
-                return false;
-*/
-    return true;
-}
-
 void MM_rotate_A_rotate_B(int n, int p, int processRank)
 {
     int blockSize = n * n / p;
     int *a = new int[blockSize], *b = new int[blockSize], *c = new int[blockSize];
+
     dim = sqrt(p);
 
     distribute_blocks(M1, a, n, p, processRank);
@@ -266,9 +272,50 @@ void MM_rotate_A_rotate_B(int n, int p, int processRank)
     delete a, delete b, delete c;
 }
 
-void iterate_and_multiply(int *a, int *b, int *c, int n, int p, int processorRank, MPI_Comm columnGroup)
+inline void shift_block(int *a, int *temp_a, int blockSize,
+                        int leftRecvr, int rightSendr)
 {
+    MPI_Request sendReq, recvReq;
 
+    MPI_Isend(a, blockSize, MPI_INT, leftRecvr, 0, MPI_COMM_WORLD, &sendReq),
+    MPI_Irecv(temp_a, blockSize, MPI_INT, rightSendr, MPI_ANY_TAG, MPI_COMM_WORLD, &recvReq);
+
+
+    MPI_Wait(&sendReq, MPI_STATUS_IGNORE), MPI_Wait(&recvReq, MPI_STATUS_IGNORE);
+    memcpy(a, temp_a, blockSize * sizeof(int));
+}
+
+void iterate_and_multiply(int *a, int *b_init, int *c, int n, int p, int processRank, MPI_Comm columnGroup)
+{
+    int blockDim = n / dim, blockSize = n * n / p, processRow, processCol, columnRank;
+    int *temp_a = new int[blockSize], *b = new int[blockSize];
+
+    //dim = sqrt(p);
+
+    get_2D_indices(processRank, processRow, processCol);
+    MPI_Comm_rank(columnGroup, &columnRank);
+
+    for(int i = 1; i <= dim; ++i)
+    {
+        int bcastSrc = (processCol + i - 1) % dim;
+
+        if(columnRank == bcastSrc)
+            memcpy(b, b_init, blockSize * sizeof(int));
+
+        MPI_Bcast(b, blockSize, MPI_INT, bcastSrc, columnGroup);
+
+        multiply_matrices(a, b, c, blockDim);
+
+        if(i < dim)
+        {
+            int leftRecvr = get_1D_index(processRow, (processCol - 1 + dim) % dim),
+                rightSendr = get_1D_index(processRow, (processCol + 1) % dim);
+
+            shift_block(a, temp_a, blockSize, leftRecvr, rightSendr);
+        }
+    }
+
+    delete temp_a, delete b;
 }
 
 void MM_rotate_A_broadcast_B(int n, int p, int processRank)
@@ -276,6 +323,7 @@ void MM_rotate_A_broadcast_B(int n, int p, int processRank)
     int blockSize = n * n / p, processRow, processCol;
     int *a = new int[blockSize], *b = new int[blockSize], *c = new int[blockSize];
     MPI_Comm columnGroup;
+
     dim = sqrt(p);
 
     distribute_blocks(M1, a, n, p, processRank);
@@ -286,7 +334,64 @@ void MM_rotate_A_broadcast_B(int n, int p, int processRank)
     get_2D_indices(processRank, processRow, processCol);
     MPI_Comm_split(MPI_COMM_WORLD, processCol, processRow, &columnGroup);
 
+    iterate_and_multiply(a, b, c, n, p, processRank, columnGroup);
 
+    collect_blocks(M4, c, n, p, processRank);
+
+    delete a, delete b, delete c;
+}
+
+
+void iterate_and_multiply(int *a_init, int *b_init, int *c, int n, int p, int processRank, MPI_Comm rowGroup, MPI_Comm columnGroup)
+{
+    int blockDim = n / dim, blockSize = n * n / p, processRow, processCol, rowRank, columnRank;
+    int *a = new int[blockSize], *b = new int[blockSize];
+
+    get_2D_indices(processRank, processRow, processCol);
+    MPI_Comm_rank(rowGroup, &rowRank);
+    MPI_Comm_rank(columnGroup, &columnRank);
+
+    for(int i = 1; i <= dim; ++i)
+    {
+        int bcastSrc = i - 1;
+
+        if(rowRank == bcastSrc)
+            memcpy(a, a_init, blockSize * sizeof(int));
+
+        MPI_Bcast(a, blockSize, MPI_INT, bcastSrc, rowGroup);
+
+        if(columnRank == bcastSrc)
+            memcpy(b, b_init, blockSize * sizeof(int));
+
+        MPI_Bcast(b, blockSize, MPI_INT, bcastSrc, columnGroup);
+
+        multiply_matrices(a, b, c, blockDim);
+    }
+
+    delete a, delete b;
+}
+
+void MM_broadcast_A_broadcast_B(int n, int p, int processRank)
+{
+    int blockSize = n * n / p, processRow, processCol;
+    int *a = new int[blockSize], *b = new int[blockSize], *c = new int[blockSize];
+    MPI_Comm rowGroup, columnGroup;
+
+    dim = sqrt(p);
+
+    distribute_blocks(M1, a, n, p, processRank),
+    distribute_blocks(M2, b, n, p, processRank);
+
+    memset(c, 0, blockSize * sizeof(int));
+
+    get_2D_indices(processRank, processRow, processCol);
+
+    MPI_Comm_split(MPI_COMM_WORLD, processRow, processCol, &rowGroup),
+    MPI_Comm_split(MPI_COMM_WORLD, processCol, processRow, &columnGroup);
+
+    iterate_and_multiply(a, b, c, n, p, processRank, rowGroup, columnGroup);
+
+    collect_blocks(M5, c, n, p, processRank);
 
     delete a, delete b, delete c;
 }
@@ -310,26 +415,8 @@ int main(int argc, char *argv[])
         get_random_square_matrix(M1, n), get_random_square_matrix(M2, n);
 
     MM_rotate_A_rotate_B(n, p, processRank);
-
-    /*
-    int *a = new int[n * n  / p], *b = new int[n * n / p], *c = new int[n * n / p];
-
-    distribute_blocks(M1, a, n, p, processRank);
-    distribute_blocks(M2, b, n, p, processRank);
-
-
-    align_initially(a, b, c, n, p, processRank);
-
-    //puts("initial distribution done.");
-
-    iterate_and_multiply(a, b, c, n, p, processRank);
-
-    //printf("Iteration of matrix multiplications done for process %d.\n", processRank);
-
-    collect_blocks(M3, c, n, p, processRank);
-
-    delete a, delete b, delete c;
-    */
+    MM_rotate_A_broadcast_B(n, p, processRank);
+    MM_broadcast_A_broadcast_B(n, p, processRank);
 
     if(processRank == MASTER)
     {
@@ -337,10 +424,16 @@ int main(int argc, char *argv[])
         //print_matrix("\nB", M2, n);
 
         int C[MAX_DIM][MAX_DIM];
-        printf("%s matrix multiplication for n = %d.\n", verify_correctness(M1, M2, C, M3, n) ? "Correct" : "Incorrect", n);
+        printf("%s rotate-A-rotate-B for n = %d.\n", verify_correctness(M1, M2, C, M3, n) ? "Correct" : "Incorrect", n);
+        printf("%s rotate-A-broadcast-B for n = %d.\n", verify_correctness(M1, M2, C, M4, n) ? "Correct" : "Incorrect", n);
+        printf("%s broadcast-A-broadcast-B for n = %d.\n", verify_correctness(M1, M2, C, M5, n) ? "Correct" : "Incorrect", n);
+
+
 
         //print_matrix("\nCorrect result:", C, n);
-        //print_matrix("\n Result from parallel computation:", M3, n);
+        //print_matrix("\n Result from rotate-A-rotate-B:", M3, n);
+        //print_matrix("\n Result from rotate-A-broadcast-B:", M4, n);
+        //print_matrix("\n Result from broadcast-A-broadcast-B:", M5, n);
     }
 
     MPI_Finalize();

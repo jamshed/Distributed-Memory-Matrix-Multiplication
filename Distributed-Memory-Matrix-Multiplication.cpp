@@ -3,14 +3,17 @@
 #include<cmath>
 #include<cstdlib>
 #include<mpi.h>
+#include<ctime>
+#include<chrono>
 
 using namespace std;
+using namespace chrono;
 
-#define MAX_DIM 1025
+#define MAX_DIM 1024
 #define UB 101
 #define MASTER 0
 
-int M1[MAX_DIM][MAX_DIM], M2[MAX_DIM][MAX_DIM], M3[MAX_DIM][MAX_DIM], M4[MAX_DIM][MAX_DIM], M5[MAX_DIM][MAX_DIM];
+int M1[MAX_DIM][MAX_DIM], M2[MAX_DIM][MAX_DIM], M3[MAX_DIM][MAX_DIM];
 int dim;
 
 
@@ -31,12 +34,17 @@ inline void get_2D_indices(int idx, int &x, int &y, int d = dim)
 
 // Get the k parameter value from command line arguments. The input matrices dimension will be 2^k x 2^k.
 
-void parse_input(int argc, char *argv[], int &n)
+void parse_input(int argc, char *argv[], int &n, int &a)
 {
     for(int i = 0; i < argc; ++i)
         if(!strcmp(argv[i], "-k"))
         {
             n = atoi(argv[i + 1]);
+            i++;
+        }
+        else if(!strcmp(argv[i], "-a"))
+        {
+            a = atoi(argv[i + 1]);
             i++;
         }
 }
@@ -86,11 +94,12 @@ void print_array(const char *message, int *A, int n)
 }
 
 // Verify the correctness of the n-dimensional result matrix R = A x B,
-// comparing it with a correct (output from serial multiplication) output matrix C.
+// comparing it with a correct output from serial multiplication.
 
-bool verify_correctness(int A[MAX_DIM][MAX_DIM], int B[MAX_DIM][MAX_DIM], int C[MAX_DIM][MAX_DIM],
-                        int R[MAX_DIM][MAX_DIM], int n)
+bool verify_correctness(int A[MAX_DIM][MAX_DIM], int B[MAX_DIM][MAX_DIM], int R[MAX_DIM][MAX_DIM], int n)
 {
+    int C[MAX_DIM][MAX_DIM];
+
     for(int i = 0; i < n; ++i)
         for(int j = 0; j < n; ++j)
         {
@@ -248,7 +257,7 @@ void collect_blocks(int M[MAX_DIM][MAX_DIM], int *sendBuf, int n, int p, int pro
 }
 
 
-void MM_rotate_A_rotate_B(int n, int p, int processRank)
+void MM_rotate_A_rotate_B(int n, int p, int processRank, int M[MAX_DIM][MAX_DIM])
 {
     int blockSize = n * n / p;
     int *a = new int[blockSize], *b = new int[blockSize], *c = new int[blockSize];
@@ -262,7 +271,7 @@ void MM_rotate_A_rotate_B(int n, int p, int processRank)
 
     iterate_and_multiply(a, b, c, n, p, processRank);
 
-    collect_blocks(M3, c, n, p, processRank);
+    collect_blocks(M, c, n, p, processRank);
 
     delete a, delete b, delete c;
 }
@@ -318,7 +327,7 @@ void iterate_and_multiply(int *a, int *b_init, int *c, int n, int p, int process
 }
 
 
-void MM_rotate_A_broadcast_B(int n, int p, int processRank)
+void MM_rotate_A_broadcast_B(int n, int p, int processRank, int M[MAX_DIM][MAX_DIM])
 {
     int blockSize = n * n / p, processRow, processCol;
     int *a = new int[blockSize], *b = new int[blockSize], *c = new int[blockSize];
@@ -336,7 +345,7 @@ void MM_rotate_A_broadcast_B(int n, int p, int processRank)
 
     iterate_and_multiply(a, b, c, n, p, processRank, columnGroup);
 
-    collect_blocks(M4, c, n, p, processRank);
+    collect_blocks(M, c, n, p, processRank);
 
     MPI_Comm_free(&columnGroup);
 
@@ -377,7 +386,7 @@ void iterate_and_multiply(int *a_init, int *b_init, int *c, int n, int p, int pr
 }
 
 
-void MM_broadcast_A_broadcast_B(int n, int p, int processRank)
+void MM_broadcast_A_broadcast_B(int n, int p, int processRank, int M[MAX_DIM][MAX_DIM])
 {
     int blockSize = n * n / p, processRow, processCol;
     int *a = new int[blockSize], *b = new int[blockSize], *c = new int[blockSize];
@@ -397,7 +406,7 @@ void MM_broadcast_A_broadcast_B(int n, int p, int processRank)
 
     iterate_and_multiply(a, b, c, n, p, processRank, rowGroup, columnGroup);
 
-    collect_blocks(M5, c, n, p, processRank);
+    collect_blocks(M, c, n, p, processRank);
 
 
     MPI_Comm_free(&rowGroup), MPI_Comm_free(&columnGroup);
@@ -406,13 +415,29 @@ void MM_broadcast_A_broadcast_B(int n, int p, int processRank)
 }
 
 
+void multiply_matrices(int n, int p, int processRank, int method)
+{
+    if(method == 0)
+        MM_rotate_A_rotate_B(n, p, processRank, M3);
+    else if(method == 1)
+        MM_rotate_A_broadcast_B(n, p, processRank, M3);
+    else if(method == 2)
+        MM_broadcast_A_broadcast_B(n, p, processRank, M3);
+    else
+        puts("Invalid method.");
+
+    if(processRank == MASTER)
+        printf("%s for method %d with n = %d.\n", verify_correctness(M1, M2, M3, n) ? "Correct" : "Incorrect", method, n);
+}
+
+
 int main(int argc, char *argv[])
 {
-    int n, p, processRank;
+    int n, p, processRank, alg;
 
     srand(time(NULL));
 
-    parse_input(argc, argv, n);
+    parse_input(argc, argv, n, alg);
     n = (1 << n);
 
     MPI_Init(&argc, &argv);
@@ -423,6 +448,10 @@ int main(int argc, char *argv[])
     if(processRank == MASTER)
         get_random_square_matrix(M1, n), get_random_square_matrix(M2, n);
 
+    multiply_matrices(n, p, processRank, alg);
+
+
+    /*
     MM_rotate_A_rotate_B(n, p, processRank);
     MM_rotate_A_broadcast_B(n, p, processRank);
     MM_broadcast_A_broadcast_B(n, p, processRank);
@@ -442,6 +471,7 @@ int main(int argc, char *argv[])
         //print_matrix("\n Result from rotate-A-broadcast-B:", M4, n);
         //print_matrix("\n Result from broadcast-A-broadcast-B:", M5, n);
     }
+    */
 
     MPI_Finalize();
 
